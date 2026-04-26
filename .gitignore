@@ -1,0 +1,12 @@
+checkpoints/
+pretrain/
+outputs/
+wandb/
+logs/
+__pycache__/
+.ipynb_checkpoints/
+*.pth
+*.pt
+*.bin
+*.pkl
+*.pyc
