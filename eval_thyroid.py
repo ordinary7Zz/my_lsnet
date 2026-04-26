@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -86,6 +86,30 @@ def parse_args():
             "be appended to this file."
         ),
     )
+    parser.add_argument(
+        "--ece-bins",
+        type=int,
+        default=10,
+        help="Number of bins for ECE.",
+    )
+    parser.add_argument(
+        "--bootstrap-samples",
+        type=int,
+        default=2000,
+        help="Number of bootstrap resamples for confidence intervals.",
+    )
+    parser.add_argument(
+        "--ci-level",
+        type=float,
+        default=0.95,
+        help="Confidence level for bootstrap confidence intervals.",
+    )
+    parser.add_argument(
+        "--bootstrap-seed",
+        type=int,
+        default=0,
+        help="Random seed for bootstrap resampling.",
+    )
     return parser.parse_args()
 
 
@@ -141,12 +165,116 @@ def load_model_from_checkpoint(
     return model, num_classes, model_name
 
 
+def compute_ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> float:
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+
+    for bin_idx in range(n_bins):
+        lower = bin_edges[bin_idx]
+        upper = bin_edges[bin_idx + 1]
+        if bin_idx == n_bins - 1:
+            in_bin = (y_prob >= lower) & (y_prob <= upper)
+        else:
+            in_bin = (y_prob >= lower) & (y_prob < upper)
+
+        if not np.any(in_bin):
+            continue
+
+        bin_prob = y_prob[in_bin]
+        bin_true = y_true[in_bin]
+        bin_acc = np.mean(bin_true)
+        bin_conf = np.mean(bin_prob)
+        ece += (len(bin_prob) / len(y_prob)) * abs(bin_acc - bin_conf)
+
+    return float(ece)
+
+
+def compute_point_metrics(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    ece_bins: int,
+) -> Dict[str, float]:
+    y_pred = (y_prob >= 0.5).astype(int)
+
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+
+    return {
+        "AUROC": float(roc_auc_score(y_true, y_prob)),
+        "AUPRC": float(average_precision_score(y_true, y_prob)),
+        "Acc": float(acc),
+        "Prec": float(prec),
+        "Recall": float(rec),
+        "F1": float(f1),
+        "Specificity": float(specificity),
+        "ECE": compute_ece(y_true, y_prob, n_bins=ece_bins),
+        "TN": int(tn),
+        "FP": int(fp),
+        "FN": int(fn),
+        "TP": int(tp),
+        "N": int(len(y_true)),
+    }
+
+
+def bootstrap_metrics_ci(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    ece_bins: int,
+    n_bootstrap: int,
+    ci_level: float,
+    seed: int,
+) -> Dict[str, Tuple[float, float]]:
+    rng = np.random.default_rng(seed)
+    pos_idx = np.flatnonzero(y_true == 1)
+    neg_idx = np.flatnonzero(y_true == 0)
+
+    if len(pos_idx) == 0 or len(neg_idx) == 0:
+        raise ValueError("Bootstrap CI requires both positive and negative samples.")
+
+    metric_names = ["AUROC", "AUPRC", "Acc", "Prec", "Recall", "F1", "Specificity", "ECE"]
+    bootstrap_values = {name: [] for name in metric_names}
+
+    for _ in range(n_bootstrap):
+        sampled_pos = rng.choice(pos_idx, size=len(pos_idx), replace=True)
+        sampled_neg = rng.choice(neg_idx, size=len(neg_idx), replace=True)
+        sampled_idx = np.concatenate([sampled_pos, sampled_neg])
+        rng.shuffle(sampled_idx)
+
+        sampled_true = y_true[sampled_idx]
+        sampled_prob = y_prob[sampled_idx]
+        sampled_metrics = compute_point_metrics(sampled_true, sampled_prob, ece_bins)
+
+        for name in metric_names:
+            bootstrap_values[name].append(sampled_metrics[name])
+
+    alpha = 1.0 - ci_level
+    lower_q = 100.0 * (alpha / 2.0)
+    upper_q = 100.0 * (1.0 - alpha / 2.0)
+
+    return {
+        name: (
+            float(np.percentile(values, lower_q)),
+            float(np.percentile(values, upper_q)),
+        )
+        for name, values in bootstrap_values.items()
+    }
+
+
 @torch.no_grad()
 def evaluate_one_dataset(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
     pos_class_index: int,
+    ece_bins: int,
+    n_bootstrap: int,
+    ci_level: float,
+    bootstrap_seed: int,
 ) -> dict:
     all_probs: List[float] = []
     all_labels: List[int] = []
@@ -176,32 +304,19 @@ def evaluate_one_dataset(
             f"Expected binary labels for AUROC/AUPRC, got classes: {np.unique(y_true)}"
         )
 
-    y_pred = (y_prob >= 0.5).astype(int)
-
-    acc = accuracy_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred, zero_division=0)
-    rec = recall_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-
-    auroc = roc_auc_score(y_true, y_prob)
-    auprc = average_precision_score(y_true, y_prob)
+    point_metrics = compute_point_metrics(y_true, y_prob, ece_bins)
+    ci_metrics = bootstrap_metrics_ci(
+        y_true=y_true,
+        y_prob=y_prob,
+        ece_bins=ece_bins,
+        n_bootstrap=n_bootstrap,
+        ci_level=ci_level,
+        seed=bootstrap_seed,
+    )
 
     return {
-        "AUROC": auroc,
-        "AUPRC": auprc,
-        "Acc": acc,
-        "Prec": prec,
-        "Recall": rec,
-        "F1": f1,
-        "Specificity": specificity,
-        "TN": int(tn),
-        "FP": int(fp),
-        "FN": int(fn),
-        "TP": int(tp),
-        "N": int(len(y_true)),
+        **point_metrics,
+        "CI": ci_metrics,
     }
 
 
@@ -259,15 +374,28 @@ def main():
             dataloader=dataloader,
             device=device,
             pos_class_index=args.pos_class_index,
+            ece_bins=args.ece_bins,
+            n_bootstrap=args.bootstrap_samples,
+            ci_level=args.ci_level,
+            bootstrap_seed=args.bootstrap_seed,
         )
 
         log(f"Samples: {metrics['N']}")
         log(f"TN={metrics['TN']} FP={metrics['FP']} FN={metrics['FN']} TP={metrics['TP']}")
+        ci = metrics["CI"]
         log(
-            f"AUROC={metrics['AUROC']:.4f}  AUPRC={metrics['AUPRC']:.4f}  "
-            f"Acc={metrics['Acc']:.4f}  Prec={metrics['Prec']:.4f}  "
-            f"Recall={metrics['Recall']:.4f}  F1={metrics['F1']:.4f}  "
-            f"Specificity={metrics['Specificity']:.4f}"
+            f"AUROC={metrics['AUROC']:.4f} [{ci['AUROC'][0]:.4f}, {ci['AUROC'][1]:.4f}]  "
+            f"AUPRC={metrics['AUPRC']:.4f} [{ci['AUPRC'][0]:.4f}, {ci['AUPRC'][1]:.4f}]"
+        )
+        log(
+            f"Acc={metrics['Acc']:.4f} [{ci['Acc'][0]:.4f}, {ci['Acc'][1]:.4f}]  "
+            f"Prec={metrics['Prec']:.4f} [{ci['Prec'][0]:.4f}, {ci['Prec'][1]:.4f}]  "
+            f"Recall={metrics['Recall']:.4f} [{ci['Recall'][0]:.4f}, {ci['Recall'][1]:.4f}]"
+        )
+        log(
+            f"F1={metrics['F1']:.4f} [{ci['F1'][0]:.4f}, {ci['F1'][1]:.4f}]  "
+            f"Specificity={metrics['Specificity']:.4f} [{ci['Specificity'][0]:.4f}, {ci['Specificity'][1]:.4f}]  "
+            f"ECE={metrics['ECE']:.4f} [{ci['ECE'][0]:.4f}, {ci['ECE'][1]:.4f}]"
         )
 
     if log_f is not None:
